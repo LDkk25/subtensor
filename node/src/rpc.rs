@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use futures::channel::mpsc;
+use futures::{StreamExt, channel::mpsc};
 
 use crate::{
     client::{FullBackend, FullClient},
@@ -17,18 +17,84 @@ use fc_rpc::EthBlockDataCacheTask;
 pub use fc_rpc_core::types::{FeeHistoryCache, FeeHistoryCacheLimit, FilterPool};
 /// Frontier DB backend type.
 pub use fc_storage::StorageOverride;
-use jsonrpsee::{Methods, RpcModule};
+use jsonrpsee::{
+    Methods, RpcModule,
+    core::{SubscriptionResult, async_trait},
+    proc_macros::rpc,
+    server::{PendingSubscriptionSink, SubscriptionMessage},
+};
 use node_subtensor_runtime::opaque::Block;
 use sc_consensus_manual_seal::EngineCommand;
 use sc_network::service::traits::NetworkService;
 use sc_network_sync::SyncingService;
 use sc_rpc::SubscriptionTaskExecutor;
-use sc_transaction_pool_api::TransactionPool;
+use sc_transaction_pool_api::{InPoolTransaction, TransactionPool};
 use sp_core::H256;
 use sp_inherents::CreateInherentDataProviders;
-use sp_runtime::{OpaqueExtrinsic, traits::BlakeTwo256, traits::Block as BlockT};
+use sp_runtime::{OpaqueExtrinsic, codec::Encode, traits::BlakeTwo256, traits::Block as BlockT};
 use std::collections::BTreeMap;
 use subtensor_runtime_common::Hash;
+
+#[rpc(server, client, namespace = "author")]
+/// RPC API to subscribe newly imported pending extrinsics.
+pub trait PendingTxPubSubApi {
+    #[subscription(
+        name = "subscribeNewPendingExtrinsics",
+        unsubscribe = "unsubscribeNewPendingExtrinsics",
+        item = String
+    )]
+    /// Subscribe to newly imported pending extrinsics.
+    async fn subscribe_new_pending_extrinsics(&self) -> SubscriptionResult;
+}
+
+/// Pending extrinsic pubsub handler.
+pub struct PendingTxPubSub<P> {
+    pool: Arc<P>,
+}
+
+impl<P> PendingTxPubSub<P> {
+    /// Create a new pending transaction pubsub handler.
+    pub fn new(pool: Arc<P>) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl<P> PendingTxPubSubApiServer for PendingTxPubSub<P>
+where
+    P: TransactionPool<
+            Block = Block,
+            Hash = <sp_runtime::generic::Block<
+                sp_runtime::generic::Header<u32, BlakeTwo256>,
+                OpaqueExtrinsic,
+            > as BlockT>::Hash,
+        > + 'static,
+{
+    async fn subscribe_new_pending_extrinsics(
+        &self,
+        pending: PendingSubscriptionSink,
+    ) -> SubscriptionResult {
+        let sink = pending.accept().await?;
+        let mut import_stream = self.pool.import_notification_stream();
+
+        while let Some(tx_hash) = import_stream.next().await {
+            let tx_hex = {
+                let Some(tx) = self.pool.ready_transaction(&tx_hash) else {
+                    continue;
+                };
+                format!("0x{}", hex::encode(tx.data().as_ref().encode()))
+            };
+
+            let msg = SubscriptionMessage::from_json(&tx_hex)?;
+
+            if sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+}
 
 /// Extra dependencies for Ethereum compatibility.
 pub struct EthDeps<P, CT, CIDP> {
@@ -142,6 +208,7 @@ where
 
     module.merge(System::new(client.clone(), pool.clone()).into_rpc())?;
     module.merge(TransactionPayment::new(client.clone()).into_rpc())?;
+    module.merge(PendingTxPubSub::new(pool.clone()).into_rpc())?;
 
     // Extend this RPC with a custom API by using the following syntax.
     // `YourRpcStruct` should have a reference to a client, which is needed
